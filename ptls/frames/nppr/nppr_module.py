@@ -2,33 +2,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Encoder for creating transaction embeddings
 class TransactionEncoder(nn.Module):
-    def __init__(self, num_numerical_features, num_categories, hidden_size=512, embedding_size=512):
+    def __init__(self, num_numeric_features, embedding_dims, hidden_size=512, embedding_size=512):
         """
         Initializes the transaction encoder.
 
         Args:
-            num_numerical_features (int): Number of numeric features.
-            num_categories (list of int): List where each element represents the number of unique categories 
-                                          for a categorical feature.
+            num_numeric_features (int): Number of numeric features.
+            embedding_dims (dict): Dictionary with structure {feature_name: {'in': dictionary_size, 'out': embedding_size}} 
+                                   for each categorical feature.
             hidden_size (int): Size of the hidden layers in the MLP and GRU.
             embedding_size (int): Output size of the transaction embedding.
         """
         super(TransactionEncoder, self).__init__()
         
         # Normalization layer for numeric features
-        self.numeric_norm = nn.BatchNorm1d(num_numerical_features)
+        self.numeric_norm = nn.BatchNorm1d(num_numeric_features)
         
-        # Initialize embedding layers for each categorical feature with embedding dimension of 1
-        self.embeddings = nn.ModuleList([nn.Embedding(num_categories[i], 1) for i in range(len(num_categories))])
+        # Initialize embedding layers for each categorical feature
+        self.embeddings = nn.ModuleDict({
+            feature: nn.Embedding(num_embeddings=params['in'], embedding_dim=params['out'])
+            for feature, params in embedding_dims.items()
+        })
         
-        # Total embedding dimension is the sum of all 1D embeddings for categorical features
-        total_embed_dim = len(num_categories)  # Each categorical feature contributes one dimension
+        # Calculate total embedding dimension as the sum of all individual embedding dimensions
+        total_embed_dim = sum(params['out'] for params in embedding_dims.values())
         
         # MLP for preprocessing features before GRU
         self.preprocess_mlp = nn.Sequential(
-            nn.Linear(num_numerical_features + total_embed_dim, hidden_size),
+            nn.Linear(num_numeric_features + total_embed_dim, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU()
@@ -49,8 +51,9 @@ class TransactionEncoder(nn.Module):
 
         Args:
             x_numeric (Tensor): Tensor of numeric features with shape (batch_size, num_numeric_features).
-            x_categorical (Tensor): Tensor of categorical features with shape (batch_size, num_categorical_features).
-        
+            x_categorical (dict of Tensor): Dictionary of tensors for categorical features, with shape 
+                                            (batch_size,) for each feature.
+
         Returns:
             e_t (Tensor): Embedding of the transaction with shape (batch_size, embedding_size).
             h_t (Tensor): Updated hidden state from the GRU with shape (1, batch_size, hidden_size).
@@ -58,11 +61,14 @@ class TransactionEncoder(nn.Module):
         # Normalize numeric features
         x_numeric = self.numeric_norm(x_numeric)
         
-        # Pass each categorical feature through its embedding layer and concatenate the results
-        x_embed = [self.embeddings[i](x_categorical[:, i]).squeeze(-1) for i in range(len(self.embeddings))]
-        x_embed = torch.stack(x_embed, dim=-1)  # Concatenate along feature dimension
+        # Pass each categorical feature through its respective embedding layer
+        embedded_categorical_features = []
+        for feature, emb_layer in self.embeddings.items():
+            embedded_feature = emb_layer(x_categorical[feature])
+            embedded_categorical_features.append(embedded_feature)
         
-        # Concatenate normalized numeric features and embedded categorical features
+        # Concatenate all embedded categorical features along with numeric features
+        x_embed = torch.cat(embedded_categorical_features, dim=-1)
         x = torch.cat([x_numeric, x_embed], dim=-1)
         
         # Pass through MLP
@@ -185,11 +191,13 @@ class PRDecoder(nn.Module):
 
 # Main model combining encoder and two decoders
 class NPPRModel(nn.Module):
-    def __init__(self, embedding_size=512, hidden_size=512, num_numerical_features=1, num_categories=[]):
+    def __init__(self, embedding_dims, embedding_size=512, hidden_size=512, num_numerical_features=1, num_categories=[]):
         """
         Initializes the NPPR model.
 
         Args:
+            embedding_dims (dict): Dictionary with structure {feature_name: {'in': dictionary_size, 'out': embedding_size}} 
+                                   for each categorical feature.
             num_numerical_features (int): Number of numeric features.
             hidden_size (int): Hidden size for the encoder and decoders.
             embedding_size (int): Size of the final embedding.
@@ -197,7 +205,7 @@ class NPPRModel(nn.Module):
                                           for a categorical feature.
         """
         super(NPPRModel, self).__init__()
-        self.encoder = TransactionEncoder(num_numerical_features, num_categories, hidden_size, embedding_size)
+        self.encoder = TransactionEncoder(num_numeric_features, embedding_dims, hidden_size, embedding_size)
         self.np_decoder = NPDecoder(embedding_size, hidden_size, num_numerical_features, num_categories)
         self.pr_decoder = PRDecoder(embedding_size, hidden_size, num_numerical_features, num_categories)
 
