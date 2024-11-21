@@ -2,87 +2,92 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class TransactionEncoder(nn.Module):
-    def __init__(self, num_numeric_features, embedding_dims, hidden_size=512, embedding_size=512):
+class NPPREncoder(nn.Module):
+    def __init__(self, num_numerical_features, embedding_dims, hidden_size, embedding_size):
         """
-        Initializes the transaction encoder.
+        Initializes the NPPREncoder.
 
         Args:
-            num_numeric_features (int): Number of numeric features.
-            embedding_dims (dict): Dictionary with structure {feature_name: {'in': dictionary_size, 'out': embedding_size}} 
-                                   for each categorical feature.
-            hidden_size (int): Size of the hidden layers in the MLP and GRU.
-            embedding_size (int): Output size of the transaction embedding.
+            num_numerical_features (int): Number of numerical features.
+            embedding_dims (dict): Dictionary of embedding sizes for categorical features.
+                                   Example: {"currency": {"in": 5, "out": 16}, ...}.
+            hidden_size (int): Hidden size for the GRU layer.
+            embedding_size (int): Final embedding size.
         """
-        super(TransactionEncoder, self).__init__()
-        
-        # Normalization layer for numeric features
-        self.numeric_norm = nn.BatchNorm1d(num_numeric_features)
-        
-        # Initialize embedding layers for each categorical feature
+        super(NPPREncoder, self).__init__()
+
+        self.embedding_dims = embedding_dims
+
+        # BatchNorm for numerical features
+        self.numeric_norm = nn.BatchNorm1d(num_numerical_features)
+
+        # Embedding layers for categorical features
         self.embeddings = nn.ModuleDict({
-            feature: nn.Embedding(num_embeddings=params['in'], embedding_dim=params['out'])
-            for feature, params in embedding_dims.items()
+            feature: nn.Embedding(num_embeddings=dims["in"], embedding_dim=dims["out"], padding_idx=-1)
+            for feature, dims in embedding_dims.items()
         })
-        
-        # Calculate total embedding dimension as the sum of all individual embedding dimensions
-        total_embed_dim = sum(params['out'] for params in embedding_dims.values())
-        
-        # MLP for preprocessing features before GRU
-        self.preprocess_mlp = nn.Sequential(
-            nn.Linear(num_numeric_features + total_embed_dim, hidden_size),
+
+        # Total input size for GRU (numerical + sum of embedding sizes)
+        input_size = num_numerical_features + sum(dims["out"] for dims in embedding_dims.values())
+
+        # MLP with two hidden layers
+        self.mlp = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU()
         )
-        
-        # GRU layer to process sequential data
+
+        # GRU layer
         self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
-        
-        # Projection layer to produce final transaction embedding
-        self.proj_layer = nn.Sequential(
+
+        # Final projection layer
+        self.projection = nn.Sequential(
             nn.Linear(hidden_size, embedding_size),
             nn.Sigmoid()
         )
 
     def forward(self, x_numeric, x_categorical):
         """
-        Forward pass for encoding a sequence of transactions.
+        Forward pass for the NPPREncoder.
 
         Args:
-            x_numeric (Tensor): Tensor of numeric features with shape (batch_size, num_numeric_features).
-            x_categorical (dict of Tensor): Dictionary of tensors for categorical features, with shape 
-                                            (batch_size,) for each feature.
+            x_numeric (Tensor): Numerical features, shape (batch_size, max_seq_len, num_numerical_features).
+            x_categorical (Tensor): Categorical features, shape (batch_size, max_seq_len, num_categorical_features).
 
         Returns:
-            e_t (Tensor): Embedding of the transaction with shape (batch_size, embedding_size).
-            h_t (Tensor): Updated hidden state from the GRU with shape (1, batch_size, hidden_size).
+            Tuple[Tensor, Tensor]: Event embeddings (e_t) and hidden states (h_t) from the GRU.
         """
-        # Normalize numeric features
-        x_numeric = self.numeric_norm(x_numeric)
-        
-        # Pass each categorical feature through its respective embedding layer
-        embedded_categorical_features = []
-        for feature, emb_layer in self.embeddings.items():
-            embedded_feature = emb_layer(x_categorical[feature])
-            embedded_categorical_features.append(embedded_feature)
-        
-        # Concatenate all embedded categorical features along with numeric features
-        x_embed = torch.cat(embedded_categorical_features, dim=-1)
-        x = torch.cat([x_numeric, x_embed], dim=-1)
-        
+        batch_size, max_seq_len, _ = x_numeric.size()
+
+        # Reshape for BatchNorm1d: Flatten sequence for normalization
+        x_numeric_flat = x_numeric.view(-1, x_numeric.size(-1))  # Shape: (batch_size * max_seq_len, num_numerical_features)
+        x_numeric_normalized = self.numeric_norm(x_numeric_flat)
+        x_numeric_normalized = x_numeric_normalized.view(batch_size, max_seq_len, -1)
+
+        # Process categorical features: Apply embedding and concatenate
+        x_categorical_embedded = []
+        for i, (feature_name, embedding_layer) in enumerate(self.embeddings.items()):
+            feature_values = x_categorical[:, :, i]
+            embedded = embedding_layer(feature_values)  # Shape: (batch_size, max_seq_len, embedding_dim)
+            x_categorical_embedded.append(embedded)
+
+        x_categorical_combined = torch.cat(x_categorical_embedded, dim=-1)  # Shape: (batch_size, max_seq_len, total_embedding_dim)
+
+        # Concatenate numerical and categorical features
+        x_combined = torch.cat([x_numeric_normalized, x_categorical_combined], dim=-1)  # Shape: (batch_size, max_seq_len, input_size)
+
         # Pass through MLP
-        x = self.preprocess_mlp(x).unsqueeze(1)  # Unsqueeze to add sequence dimension for GRU
-        
+        x_mlp = self.mlp(x_combined)  # Shape: (batch_size, max_seq_len, hidden_size)
+
         # Pass through GRU
-        _, h_t = self.gru(x)
-        
-        # Project to final embedding space
-        e_t = self.proj_layer(h_t[-1])  # Use last hidden state for embedding
-        
+        h_t, _ = self.gru(x_mlp) # h_t: All hidden states, shape (batch_size, max_seq_len, hidden_size)
+
+        # Project to embedding space
+        e_t = self.projection(h_t)  # Shape: (batch_size, max_seq_len, embedding_size)
+
         return e_t, h_t
 
-# Decoder for NP task
 class NPDecoder(nn.Module):
     def __init__(self, embedding_size=512, hidden_size=512, num_numerical_features=1, num_categories=[]):
         """
@@ -107,33 +112,41 @@ class NPDecoder(nn.Module):
         
         # Output layer for generating outputs for numerical and categorical features
         self.output_layer = nn.Linear(hidden_size, num_numerical_features + sum(num_categories))
+        self.num_numerical_features = num_numerical_features
+        self.num_categories = num_categories
 
     def forward(self, e_t):
         """
         Forward pass for the NP decoder.
 
         Args:
-            e_t (Tensor): Event embedding for NP task.
+            e_t (Tensor): Event embedding for NP task, shape (batch_size, seq_len, embedding_size).
         
         Returns:
-            Tuple[Tensor, list of Tensor]: Numerical outputs and categorical probabilities.
+            Tuple[Tensor, list of Tensor]: Numerical outputs and categorical logits.
         """
-        x = self.decoder(e_t)
+        batch_size, seq_len, embedding_size = e_t.shape
+
+        # Flatten sequence for processing
+        e_t_flat = e_t.view(batch_size * seq_len, embedding_size)
+
+        # Pass through the decoder MLP
+        x = self.decoder(e_t_flat)
         output = self.output_layer(x)
-        
-        # Split into numerical and categorical outputs
+
+        # Split outputs into numerical and categorical components
         numerical_outputs = output[:, :self.num_numerical_features]
-        
+        numerical_outputs = numerical_outputs.view(batch_size, seq_len, -1)
+
         categorical_outputs = []
         start_idx = self.num_numerical_features
         for dim in self.num_categories:
-            categorical_part = output[:, start_idx:start_idx + dim]
-            categorical_outputs.append(torch.softmax(categorical_part, dim=-1))
+            cat_output = output[:, start_idx:start_idx + dim]
+            categorical_outputs.append(cat_output.view(batch_size, seq_len, dim))
             start_idx += dim
-        
+
         return numerical_outputs, categorical_outputs
 
-# Decoder for PR task
 class PRDecoder(nn.Module):
     def __init__(self, embedding_size=512, hidden_size=512, num_numerical_features=1, num_categories=[]):
         """
@@ -148,9 +161,9 @@ class PRDecoder(nn.Module):
         """
         super(PRDecoder, self).__init__()
         
-        # MLP decoder layers for PR task, takes time gap as an additional input
+        # MLP decoder layers for PR task
         self.decoder = nn.Sequential(
-            nn.Linear(embedding_size + 1, hidden_size),  # +1 for the time gap input
+            nn.Linear(embedding_size + 1, hidden_size),  # +1 for the concatenated time gap
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU()
@@ -158,40 +171,57 @@ class PRDecoder(nn.Module):
         
         # Output layer for generating outputs for numerical and categorical features
         self.output_layer = nn.Linear(hidden_size, num_numerical_features + sum(num_categories))
+        self.num_numerical_features = num_numerical_features
+        self.num_categories = num_categories
 
-    def forward(self, e_t, time_gap):
+    def forward(self, e_t, time_gaps):
         """
         Forward pass for the PR decoder.
 
         Args:
-            e_t (Tensor): Event embedding for PR task.
-            time_gap (Tensor): Time difference between current and past events.
-        
+            e_t (Tensor): Event embedding for PR task, shape (batch_size, seq_len, embedding_size).
+            time_gaps (Tensor): Time gaps tensor, shape (batch_size, seq_len, max_gap_len), with -1 indicating padding.
+
         Returns:
-            Tuple[Tensor, list of Tensor]: Numerical outputs and categorical probabilities.
+            Tuple[Tensor, list of Tensor]: Numerical outputs and categorical logits for each event.
         """
-        # Concatenate embedding with time gap
-        pr_input = torch.cat([e_t, time_gap.unsqueeze(1)], dim=-1)
-        
-        # Pass through PR decoder MLP
-        x = self.decoder(pr_input)
+        batch_size, seq_len, max_gap_len = time_gaps.shape
+
+        # Mask for valid time gaps
+        valid_time_mask = (time_gaps != -1)
+
+        # Use valid time gaps directly in concatenation
+        time_gaps_masked = torch.where(valid_time_mask, time_gaps, torch.tensor(0.0, device=time_gaps.device))
+
+        # Expand embeddings for max_gap_len
+        e_t_expanded = e_t.unsqueeze(2).expand(-1, -1, max_gap_len, -1)  # Shape: (batch_size, seq_len, max_gap_len, embedding_size)
+
+        # Concatenate embeddings with time gaps
+        pr_inputs = torch.cat([e_t_expanded, time_gaps_masked.unsqueeze(-1)], dim=-1)  # Shape: (batch_size, seq_len, max_gap_len, embedding_size + 1)
+
+        # Flatten sequence for processing
+        pr_inputs_flat = pr_inputs.view(batch_size * seq_len * max_gap_len, -1)  # Shape: (batch_size * seq_len * max_gap_len, embedding_size + 1)
+
+        # Pass through the decoder MLP
+        x = self.decoder(pr_inputs_flat)
         output = self.output_layer(x)
-        
-        # Split into numerical and categorical outputs
+
+        # Split outputs into numerical and categorical components
         numerical_outputs = output[:, :self.num_numerical_features]
-        
+        numerical_outputs = numerical_outputs.view(batch_size, seq_len, max_gap_len, -1)  # Shape: (batch_size, seq_len, max_gap_len, num_numerical_features)
+
         categorical_outputs = []
         start_idx = self.num_numerical_features
         for dim in self.num_categories:
-            categorical_part = output[:, start_idx:start_idx + dim]
-            categorical_outputs.append(torch.softmax(categorical_part, dim=-1))
+            cat_output = output[:, start_idx:start_idx + dim]
+            categorical_outputs.append(cat_output.view(batch_size, seq_len, max_gap_len, dim))
             start_idx += dim
-        
+
         return numerical_outputs, categorical_outputs
 
 # Main model combining encoder and two decoders
 class NPPRModel(nn.Module):
-    def __init__(self, embedding_dims, embedding_size=512, hidden_size=512, num_numerical_features=1, num_categories=[]):
+    def __init__(self, embedding_dims, embedding_size=512, hidden_size_enc=512, hidden_size_dec=512, num_numerical_features=1, num_categories=[]):
         """
         Initializes the NPPR model.
 
@@ -199,15 +229,16 @@ class NPPRModel(nn.Module):
             embedding_dims (dict): Dictionary with structure {feature_name: {'in': dictionary_size, 'out': embedding_size}} 
                                    for each categorical feature.
             num_numerical_features (int): Number of numeric features.
-            hidden_size (int): Hidden size for the encoder and decoders.
+            hidden_size_enc (int): Hidden size for the encoder.
+            hidden_size_dec (int): Hidden size for the decoders.
             embedding_size (int): Size of the final embedding.
             num_categories (list of int): List where each element represents the number of unique categories 
                                           for a categorical feature.
         """
         super(NPPRModel, self).__init__()
-        self.encoder = TransactionEncoder(num_numeric_features, embedding_dims, hidden_size, embedding_size)
-        self.np_decoder = NPDecoder(embedding_size, hidden_size, num_numerical_features, num_categories)
-        self.pr_decoder = PRDecoder(embedding_size, hidden_size, num_numerical_features, num_categories)
+        self.encoder = NPPREncoder(num_numerical_features, embedding_dims, hidden_size_enc, embedding_size)
+        self.np_decoder = NPDecoder(embedding_size, hidden_size_dec, num_numerical_features, num_categories)
+        self.pr_decoder = PRDecoder(embedding_size, hidden_size_dec, num_numerical_features, num_categories)
 
     def forward(self, x_numeric, x_categorical, time_gaps):
         """
