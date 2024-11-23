@@ -78,6 +78,8 @@ def pr_loss(pr_numerical_outputs, pr_categorical_outputs, target_numerical, targ
         ce_loss_weighted = (ce_loss_per_event * weights_flat * valid_mask_flat).sum()
 
         categorical_loss_weighted += ce_loss_weighted
+    
+    categorical_loss_weighted /= len(pr_categorical_outputs)
 
     return mse_loss_weighted + categorical_loss_weighted
 
