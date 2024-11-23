@@ -6,7 +6,7 @@ from tqdm import tqdm
 from nppr_dataset import NPPRDataset
 from nppr_loss import nppr_loss
 
-def prepare_data(data, numeric_cols, categorical_cols, time_col, max_past_events, batch_size, train):
+def get_dataloader(data, numeric_cols, categorical_cols, time_col, max_past_events, batch_size, num_workers, train):
     """
     Prepares the data for the DataLoader.
 
@@ -17,7 +17,8 @@ def prepare_data(data, numeric_cols, categorical_cols, time_col, max_past_events
         time_col (str): Column name for the time gap feature.
         max_past_events (int): Maximum number of past events to consider for time gaps.
         batch_size (int): The number of training samples processed together in a single pass.
-        train (bool): Defines whether the dataset is a training or a testing one.
+        num_workers (int): Number of subprocesses to use for data loading.
+        train (bool): Whether the dataset is a training or a testing one.
 
     Returns:
         DataLoader: DataLoader for the transaction dataset.
@@ -36,9 +37,9 @@ def prepare_data(data, numeric_cols, categorical_cols, time_col, max_past_events
         max_past_events=max_past_events
     )
     if train == True:
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=dataset.collate_fn)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=dataset.collate_fn)
     else:
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=dataset.collate_fn)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=dataset.collate_fn)
 
     return dataloader
 

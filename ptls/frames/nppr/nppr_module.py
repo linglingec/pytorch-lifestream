@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pytorch_lightning as pl
+from nppr_loss import nppr_loss
 
 class NPPREncoder(nn.Module):
     def __init__(self, num_numerical_features, embedding_dims, hidden_size, embedding_size):
@@ -220,8 +222,19 @@ class PRDecoder(nn.Module):
         return numerical_outputs, categorical_outputs
 
 # Main model combining encoder and two decoders
-class NPPRModel(nn.Module):
-    def __init__(self, embedding_dims, embedding_size=512, hidden_size_enc=512, hidden_size_dec=512, num_numerical_features=1, num_categories=[]):
+class NpprPretrainModule(pl.LightningModule):
+    def __init__(self, 
+                embedding_dims, 
+                embedding_size=512,
+                hidden_size_enc=512, 
+                hidden_size_dec=512, 
+                num_numerical_features=1, 
+                num_categories=[],
+                learning_rate=1e-3,
+                total_steps=1000,
+                pct_start=0.3,
+                lambda_param=1.0,
+                alpha=1.0):
         """
         Initializes the NPPR model.
 
@@ -234,11 +247,23 @@ class NPPRModel(nn.Module):
             embedding_size (int): Size of the final embedding.
             num_categories (list of int): List where each element represents the number of unique categories 
                                           for a categorical feature.
+            learning_rate (float): Learning rate for the optimizer.
+            total_steps (int): Total steps for the OneCycleLR scheduler.
+            pct_start (float): Percentage of the cycle spent increasing the learning rate.
+            lambda_param (float): Decay parameter for PR loss.
+            alpha (float): Weight for combining NP and PR losses.
         """
-        super(NPPRModel, self).__init__()
+        super().__init__()
+        self.save_hyperparameters()
         self.encoder = NPPREncoder(num_numerical_features, embedding_dims, hidden_size_enc, embedding_size)
         self.np_decoder = NPDecoder(embedding_size, hidden_size_dec, num_numerical_features, num_categories)
         self.pr_decoder = PRDecoder(embedding_size, hidden_size_dec, num_numerical_features, num_categories)
+
+        self.learning_rate = learning_rate
+        self.total_steps = total_steps
+        self.pct_start = pct_start
+        self.lambda_param = lambda_param
+        self.alpha = alpha
 
     def forward(self, x_numeric, x_categorical, time_gaps):
         """
@@ -257,3 +282,155 @@ class NPPRModel(nn.Module):
         pr_numerical, pr_categorical = self.pr_decoder(e_t, time_gaps)
         
         return e_t, np_numerical, np_categorical, pr_numerical, pr_categorical, h_t
+    
+    def training_step(self, batch, batch_idx):
+        """
+        Training step for PyTorch Lightning.
+
+        Args:
+            batch (tuple): A batch of input data containing numeric, categorical, and time gap tensors.
+            batch_idx (int): Index of the current batch.
+
+        Returns:
+            Tensor: Computed loss for the current batch.
+        """
+        x_numeric, x_categorical, time_gaps = batch
+
+        # Prepare targets for NP and PR tasks
+        target_np_numerical = x_numeric[:, 1:, :]
+        target_np_categorical = [x_categorical[:, 1:, i] for i in range(x_categorical.size(-1))]
+        target_pr_numerical = x_numeric[:, :-1].unsqueeze(2).expand(-1, -1, time_gaps.size(-1), -1)
+        target_pr_categorical = [
+            x_categorical[:, :-1, i].unsqueeze(2).repeat(1, 1, time_gaps.size(-1))
+            for i in range(x_categorical.size(-1))
+        ]
+
+        # Forward pass
+        e_t, np_numerical, np_categorical, pr_numerical, pr_categorical, _ = self.forward(
+            x_numeric, x_categorical, time_gaps
+        )
+        np_numerical = np_numerical[:, :-1, :]
+        np_categorical = [pred[:, :-1, :] for pred in np_categorical]
+        pr_numerical = pr_numerical[:, 1:, :, :]
+        pr_categorical = [pred[:, 1:, :, :] for pred in pr_categorical]
+        time_gaps = time_gaps[:, :-1, :]
+
+        # Compute loss
+        loss = nppr_loss(
+            np_numerical, np_categorical, pr_numerical, pr_categorical,
+            target_np_numerical, target_np_categorical,
+            target_pr_numerical, target_pr_categorical,
+            time_gaps, self.lambda_param, self.alpha
+        )
+        self.log("train_loss", loss)
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        """
+        Validation step for a single batch.
+
+        Args:
+            batch: Batch of data from the dataloader.
+            batch_idx: Index of the batch.
+
+        Returns:
+            torch.Tensor: Validation loss for the batch.
+        """
+        x_numeric, x_categorical, time_gaps = batch
+        target_np_numerical = x_numeric[:, 1:, :]
+        target_np_categorical = [x_categorical[:, 1:, i] for i in range(x_categorical.size(-1))]
+        target_pr_numerical = x_numeric[:, :-1].unsqueeze(2).expand(-1, -1, time_gaps.size(-1), -1)
+        target_pr_categorical = [
+            x_categorical[:, :-1, i].unsqueeze(2).repeat(1, 1, time_gaps.size(-1))
+            for i in range(x_categorical.size(-1))
+        ]
+        e_t, np_numerical, np_categorical, pr_numerical, pr_categorical, _ = self(
+            x_numeric, x_categorical, time_gaps
+        )
+        np_numerical = np_numerical[:, :-1, :]
+        np_categorical = [pred[:, :-1, :] for pred in np_categorical]
+        pr_numerical = pr_numerical[:, 1:, :, :]
+        pr_categorical = [pred[:, 1:, :, :] for pred in pr_categorical]
+        time_gaps = time_gaps[:, :-1, :]
+        loss = nppr_loss(
+            np_numerical, np_categorical, pr_numerical, pr_categorical,
+            target_np_numerical, target_np_categorical,
+            target_pr_numerical, target_pr_categorical,
+            time_gaps, self.lambda_param, self.alpha
+        )
+        self.log("val_loss", loss)
+        return loss
+    
+    def configure_optimizers(self):
+        """
+        Configures the optimizer and learning rate scheduler.
+
+        Returns:
+            Configuration for optimizer and scheduler.
+        """
+        optim = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer=optim,
+            max_lr=self.learning_rate,
+            total_steps=self.total_steps,
+            pct_start=self.pct_start,
+            anneal_strategy='cos',
+            cycle_momentum=False,
+            div_factor=25.0,
+            final_div_factor=10000.0,
+            three_phase=False
+        )
+        scheduler = {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}
+
+        return [optim], [scheduler]
+
+class NpprInferenceModule(nn.Module):
+    """
+    NpprInferenceModule for generating sequence embeddings for the entire dataset using a pretrained NPPR model.
+
+    Args:
+        model (nn.Module): Pretrained NPPR model with an encoder.
+        device (torch.device or str, optional): Device to use for inference ('cuda', 'cpu', or None for auto-detection).
+    """
+    def __init__(self, model: nn.Module, device: torch.device = None):
+        super(NpprInferenceModule, self).__init__()
+        self.model = model
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
+        self.model = self.model.to(self.device, non_blocking=True)
+        self.model.eval()
+
+    def forward(self, dataloader):
+        """
+        Generates sequence embeddings for the entire dataset.
+
+        Args:
+            dataloader (DataLoader): Dataloader providing batches of data.
+
+        Returns:
+            torch.Tensor: Sequence embeddings for the entire dataset, shape (total_sequences, embedding_size).
+        """
+        sequence_embeddings = []
+
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc="Encoding"):
+                # Unpack batch
+                x_numeric, x_categorical, _ = batch
+
+                # Move data to the specified device
+                x_numeric = x_numeric.to(self.device, non_blocking=True)
+                x_categorical = x_categorical.to(self.device, non_blocking=True)
+
+                # Forward pass through encoder
+                e_t, _ = self.model.encoder(x_numeric, x_categorical)  # Shape: (batch_size, max_seq_len, embedding_size)
+
+                # Average event embeddings along the sequence length dimension
+                sequence_embedding = e_t.mean(dim=1)  # Shape: (batch_size, embedding_size)
+                sequence_embeddings.append(sequence_embedding.cpu())
+
+        # Concatenate all sequence embeddings
+        sequence_embeddings = torch.cat(sequence_embeddings, dim=0)  # Shape: (total_sequences, embedding_size)
+
+        return sequence_embeddings.cpu().detach().numpy()
