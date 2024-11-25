@@ -384,53 +384,60 @@ class NpprPretrainModule(pl.LightningModule):
 
         return [optim], [scheduler]
 
-class NpprInferenceModule(nn.Module):
+class NpprInferenceModule:
     """
-    NpprInferenceModule for generating sequence embeddings for the entire dataset using a pretrained NPPR model.
+    Inference module for NpprPretrainModule to generate embeddings or predictions.
 
     Args:
-        model (nn.Module): Pretrained NPPR model with an encoder.
-        device (torch.device or str, optional): Device to use for inference ('cuda', 'cpu', or None for auto-detection).
+        model_path (str): Path to the pretrained model weights.
+        embedding_dims (dict): Same embedding dimensions used during training.
+        embedding_size (int): Embedding size for the encoder.
+        hidden_size_enc (int): Hidden size for the encoder GRU.
+        hidden_size_dec (int): Hidden size for the decoders.
+        num_numerical_features (int): Number of numerical features.
+        num_categories (list): List containing the number of unique categories for each categorical feature.
+        device (torch.device or str): Device to use for inference ('cuda', 'cpu', or None for auto-detection).
     """
-    def __init__(self, model: nn.Module, device: torch.device = None):
-        super(NpprInferenceModule, self).__init__()
-        self.model = model
-        if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = device
-        self.model = self.model.to(self.device, non_blocking=True)
+    def __init__(self, model_path, embedding_dims, embedding_size=512, hidden_size_enc=512,
+                 hidden_size_dec=512, num_numerical_features=1, num_categories=[], device=None):
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        self.model = NpprPretrainModule(
+            embedding_dims=embedding_dims,
+            embedding_size=embedding_size,
+            hidden_size_enc=hidden_size_enc,
+            hidden_size_dec=hidden_size_dec,
+            num_numerical_features=num_numerical_features,
+            num_categories=num_categories
+        )
+        checkpoint = torch.load(model_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["state_dict"])
+        self.model.to(self.device)
         self.model.eval()
 
-    def forward(self, dataloader):
+    def encode(self, dataloader: DataLoader):
         """
-        Generates sequence embeddings for the entire dataset.
+        Generates embeddings for the entire dataset using the encoder.
 
         Args:
-            dataloader (DataLoader): Dataloader providing batches of data.
+            dataloader (DataLoader): Dataloader providing batches of input data.
 
         Returns:
-            torch.Tensor: Sequence embeddings for the entire dataset, shape (total_sequences, embedding_size).
+            torch.Tensor: Sequence embeddings for the entire dataset.
         """
         sequence_embeddings = []
 
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Encoding"):
-                # Unpack batch
                 x_numeric, x_categorical, _ = batch
-
-                # Move data to the specified device
                 x_numeric = x_numeric.to(self.device, non_blocking=True)
                 x_categorical = x_categorical.to(self.device, non_blocking=True)
 
-                # Forward pass through encoder
-                e_t, _ = self.model.encoder(x_numeric, x_categorical)  # Shape: (batch_size, max_seq_len, embedding_size)
+                # Pass through encoder
+                e_t, _ = self.model.encoder(x_numeric, x_categorical)
 
-                # Average event embeddings along the sequence length dimension
-                sequence_embedding = e_t.mean(dim=1)  # Shape: (batch_size, embedding_size)
+                # Average embeddings across sequence length
+                sequence_embedding = e_t.mean(dim=1)
                 sequence_embeddings.append(sequence_embedding.cpu())
 
-        # Concatenate all sequence embeddings
-        sequence_embeddings = torch.cat(sequence_embeddings, dim=0)  # Shape: (total_sequences, embedding_size)
-
-        return sequence_embeddings.cpu().detach().numpy()
+        return torch.cat(sequence_embeddings, dim=0)
