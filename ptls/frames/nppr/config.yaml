@@ -1,0 +1,66 @@
+data:
+  train_emb_path: "data/train_emb.parquet"
+  train_clf_path: "data/train_clf.parquet"
+  test_clf_path: "data/test_clf.parquet"
+  train_target_path: "data/train_target.csv"
+  numeric_cols: ["amnt"]
+  categorical_cols: ["currency", "operation_kind", "operation_type", "operation_type_group", "ecommerce_flag", "payment_system", "income_flag", "mcc", "country", "city", "mcc_category", "day_of_week", "hour"]
+  time_col: "hour_diff"
+
+model:
+  embedding_dims:
+      currency:
+        in: 11
+        out: 16
+      operation_kind:
+        in: 7
+        out: 16
+      operation_type:
+        in: 22
+        out: 16
+      operation_type_group:
+        in: 4
+        out: 16
+      ecommerce_flag:
+        in: 3
+        out: 16
+      payment_system:
+        in: 7
+        out: 16
+      income_flag:
+        in: 3
+        out: 16
+      mcc:
+        in: 108
+        out: 16
+      country:
+        in: 24
+        out: 16
+      city:
+        in: 163
+        out: 16
+      mcc_category:
+        in: 28
+        out: 16
+      day_of_week:
+        in: 7
+        out: 16
+      hour:
+        in: 24
+        out: 16
+  embedding_size: 512
+  hidden_size_enc: 512
+  hidden_size_dec: 512
+  lambda_param: 1440
+  alpha: 0.001
+  learning_rate: 0.001
+  num_categories: [11, 7, 22, 4, 3, 7, 3, 108, 24, 163, 28, 7, 24]
+  num_numerical_features: 1
+  pct_start: 0.2
+  total_steps: 642270
+
+training:
+  batch_size: 64
+  num_workers: 8
+  num_epochs: 30
+  max_past_events: 5

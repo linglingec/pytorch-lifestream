@@ -1,17 +1,18 @@
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from pytorch_lightning.callbacks import Callback
 import pandas as pd
 from tqdm import tqdm
 from nppr_dataset import NPPRDataset
 from nppr_loss import nppr_loss
 
-def get_dataloader(data, numeric_cols, categorical_cols, time_col, max_past_events, batch_size, num_workers, train):
+def get_dataloader(data_path, numeric_cols, categorical_cols, time_col, max_past_events, batch_size, num_workers, train):
     """
     Prepares the data for the DataLoader.
 
     Args:
-        df (pd.DataFrame): Input DataFrame containing transactions.
+        data_path (str): Path to the Parquet file containing transactions.
         numeric_cols (list): List of column names for numeric features.
         categorical_cols (list): List of column names for categorical features.
         time_col (str): Column name for the time gap feature.
@@ -23,6 +24,9 @@ def get_dataloader(data, numeric_cols, categorical_cols, time_col, max_past_even
     Returns:
         DataLoader: DataLoader for the transaction dataset.
     """
+    # Load the Parquet file into a DataFrame
+    data = pd.read_parquet(data_path)
+
     # Category normalization
     for col in categorical_cols:
         unique_vals = sorted(data[col].unique())
@@ -43,126 +47,95 @@ def get_dataloader(data, numeric_cols, categorical_cols, time_col, max_past_even
 
     return dataloader
 
-def train(model, dataloader, optimizer, epochs=10, lambda_param=1.0, alpha=1.0, save_path="nppr_model.pth", device=None):
-    """
-    Trains the NPPRModel using the provided dataloader.
+class InferenceCallback(Callback):
+    def __init__(self, train_clf_dataloader, test_clf_dataloader, train_clf_path, test_clf_path, train_target_path, embedding_dims, embedding_size,
+                 hidden_size_enc, hidden_size_dec, num_numerical_features, num_categories, inference_device="cuda:1"):
+        """
+        Callback for inference and evaluation after each epoch.
 
-    Args:
-        model (NPPRModel): The NPPR model to train.
-        dataloader (DataLoader): Dataloader providing batches of data.
-        optimizer (torch.optim.Optimizer): Optimizer for training.
-        epochs (int): Number of epochs.
-        lambda_param (float): Decay parameter for PR loss.
-        alpha (float): Weight for combining NP and PR losses.
-        save_path (str): Path to save the trained model weights.
-        device (torch.device or str): Device to use for encoding ('cuda', 'cpu', or None)
+        Args:
+            train_clf_dataloader: Dataloader for training data.
+            test_clf_dataloader: Dataloader for testing data.
+            train_clf_path: Path to parquet file with training data.
+            test_clf_path: Path to parquet file with testing data.
+            train_target_path: Path to csv file with targets for app_ids.
+            embedding_dims: Embedding dimensions for the model.
+            embedding_size: Embedding size for the model.
+            hidden_size_enc: Encoder hidden size.
+            hidden_size_dec: Decoder hidden size.
+            num_numerical_features: Number of numerical features.
+            num_categories: List of number of categories for each categorical feature.
+            inference_device: Device for inference (default is "cuda:1").
+        """
+        super().__init__()
+        self.train_clf_dataloader = train_clf_dataloader
+        self.test_clf_dataloader = test_clf_dataloader
+        self.train_clf = pd.read_parquet(train_clf_path)
+        self.test_clf = pd.read_parquet(test_clf_path)
+        self.train_target = pd.read_csv(train_target_path)
+        self.embedding_dims = embedding_dims
+        self.embedding_size = embedding_size
+        self.hidden_size_enc = hidden_size_enc
+        self.hidden_size_dec = hidden_size_dec
+        self.num_numerical_features = num_numerical_features
+        self.num_categories = num_categories
+        self.inference_device = inference_device
+        self.results = []
 
-    Returns:
-        NPPRModel: The trained model.
-    """
-     # Determine device if not provided
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(device)
-    
-    model = model.to(device, non_blocking=True)
+    def on_train_epoch_end(self, trainer, pl_module):
+        # Use checkpoint from the last completed epoch
+        checkpoint_path = trainer.checkpoint_callback.last_model_path
 
-    for epoch in range(epochs):
-        model.train()
-        epoch_loss = 0.0
+        # Ensure checkpoint_path is valid
+        if not checkpoint_path:
+            raise RuntimeError("Checkpoint path for the last epoch is not available.")
 
-        for batch in tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}"):
-            # Unpack batch
-            x_numeric, x_categorical, time_gaps = batch
+        # Load the model for inference
+        inference_module = NpprInferenceModule(
+            model_path=checkpoint_path,
+            embedding_dims=self.embedding_dims,
+            embedding_size=self.embedding_size,
+            hidden_size_enc=self.hidden_size_enc,
+            hidden_size_dec=self.hidden_size_dec,
+            num_numerical_features=self.num_numerical_features,
+            num_categories=self.num_categories,
+            device=torch.device(self.inference_device)
+        )
 
-            # Move data to device
-            x_numeric = x_numeric.to(device, non_blocking=True)
-            x_categorical = x_categorical.to(device, non_blocking=True)
-            time_gaps = time_gaps.to(device, non_blocking=True)
+        # Generate embeddings
+        train_embeddings = inference_module(self.train_clf_dataloader)
+        test_embeddings = inference_module(self.test_clf_dataloader)
 
-            # Prepare targets for NP and PR tasks
-            # Target for NP task: Next event in sequence
-            target_np_numerical = x_numeric[:, 1:, :]  # Shifted sequence
-            target_np_categorical = [x_categorical[:, 1:, i] for i in range(x_categorical.size(-1))]
+        # Ensure embeddings are paired with app_id
+        train_app_ids = self.train_clf['app_id'].unique()
+        test_app_ids = self.test_clf['app_id'].unique()
 
-            # Target for PR task: Previous events in sequence
-            target_pr_numerical = x_numeric[:, :-1].unsqueeze(2).expand(-1, -1, time_gaps.size(-1), -1)
-            target_pr_categorical = [
-                x_categorical[:, :-1, i].unsqueeze(2).repeat(1, 1, time_gaps.size(-1))
-                for i in range(x_categorical.size(-1))
-            ]
+        train_embeddings_df = pd.DataFrame(train_embeddings)
+        train_embeddings_df['app_id'] = train_app_ids
 
-            # Forward pass
-            e_t, np_numerical, np_categorical, pr_numerical, pr_categorical, _ = model(x_numeric, x_categorical, time_gaps)
-            np_numerical = np_numerical[:, :-1, :]   # Align outputs and targets
-            np_categorical = [pred[:, :-1, :] for pred in np_categorical]
-            pr_numerical = pr_numerical[:, 1:, :, :]
-            pr_categorical = [pred[:, 1:, :, :] for pred in pr_categorical]
-            time_gaps = time_gaps[:, :-1, :]
+        test_embeddings_df = pd.DataFrame(test_embeddings)
+        test_embeddings_df['app_id'] = test_app_ids
 
-            # Compute loss
-            loss = nppr_loss(np_numerical, np_categorical, pr_numerical, pr_categorical, target_np_numerical, target_np_categorical, 
-                    target_pr_numerical, target_pr_categorical, time_gaps, lambda_param, alpha)
+        # Merge embeddings with targets
+        train_data = train_embeddings_df.merge(self.train_target[['app_id', 'flag']], on='app_id', how='inner')
+        test_data = test_embeddings_df.merge(self.train_target[['app_id', 'flag']], on='app_id', how='inner')
 
-            # Backpropagation
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        # Extract features and targets
+        X_train = train_data.drop(columns=['app_id', 'flag']).values
+        y_train = train_data['flag'].values
 
-            epoch_loss += loss.item()
+        X_test = test_data.drop(columns=['app_id', 'flag']).values
+        y_test = test_data['flag'].values
 
-        print(f"Epoch {epoch + 1}: Loss = {epoch_loss / len(dataloader):.4f}")
+        # Train LGBM classifier and evaluate
+        model = LGBMClassifier(random_state=42, n_estimators=500, boosting_type='gbdt', objective='binary',
+                    subsample=0.5, subsample_freq=1, learning_rate=0.02, max_depth=6, reg_alpha=1, reg_lambda=1, min_child_samples=50,
+                    colsample_bytree=0.75)
+        model.fit(X_train, y_train)
+        y_pred = model.predict_proba(X_test)[:, 1]
+        roc_auc = roc_auc_score(y_test, y_pred)
 
-    # Save model weights
-    torch.save(model.state_dict(), save_path)
-    print(f"Model saved to {save_path}")
-
-    return model
-
-def encode(model, dataloader, load_path="nppr_model.pth", device=None):
-    """
-    Encodes the transaction sequences into a single embedding per sequence by averaging the event embeddings.
-
-    Args:
-        model (NPPRModel): The NPPR model for encoding.
-        dataloader (DataLoader): Dataloader providing batches of data.
-        load_path (str): Path to load the trained model weights.
-        device (torch.device or str): Device to use for encoding ('cuda', 'cpu', or None for auto-detection).
-
-    Returns:
-        Tensor: A tensor containing a single embedding for each sequence in the dataset.
-    """
-    # Determine device if not provided
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(device)
-
-    # Load model weights
-    model.load_state_dict(torch.load(load_path, map_location=device))
-    model = model.to(device, non_blocking=True)
-    model.eval()
-
-    sequence_embeddings = []
-
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Encoding"):
-            # Unpack batch
-            x_numeric, x_categorical, _ = batch
-
-            # Move data to the specified device
-            x_numeric = x_numeric.to(device, non_blocking=True)
-            x_categorical = x_categorical.to(device, non_blocking=True)
-
-            # Forward pass through encoder
-            e_t, _ = model.encoder(x_numeric, x_categorical)  # Shape: (batch_size, max_seq_len, embedding_size)
-
-            # Average event embeddings along the sequence length dimension
-            sequence_embedding = e_t.mean(dim=1)  # Shape: (batch_size, embedding_size)
-            sequence_embeddings.append(sequence_embedding.cpu())
-
-    # Concatenate all sequence embeddings
-    sequence_embeddings = torch.cat(sequence_embeddings, dim=0)  # Shape: (total_sequences, embedding_size)
-
-    return sequence_embeddings.cpu().detach().numpy()
+        # Log and save results
+        self.results.append({'Num Epoch': trainer.current_epoch + 1, 'Score': roc_auc})
+        with open("results.txt", "a") as f:
+            f.write(f"{trainer.current_epoch + 1}\t{roc_auc:.4f}\n")
