@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from nppr_loss import nppr_loss
@@ -29,7 +31,7 @@ class NPPREncoder(nn.Module):
             for feature, dims in embedding_dims.items()
         })
 
-        # Total input size for GRU (numerical + sum of embedding sizes)
+        # Total input size for GRU
         input_size = num_numerical_features + sum(dims["out"] for dims in embedding_dims.values())
 
         # MLP with two hidden layers
@@ -440,4 +442,6 @@ class NpprInferenceModule:
                 sequence_embedding = e_t.mean(dim=1)
                 sequence_embeddings.append(sequence_embedding.cpu())
 
-        return torch.cat(sequence_embeddings, dim=0)
+            sequence_embeddings = torch.cat(sequence_embeddings, dim=0).detach().numpy()
+
+        return sequence_embeddings

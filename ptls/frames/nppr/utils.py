@@ -3,7 +3,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pytorch_lightning.callbacks import Callback
 import pandas as pd
+from lightgbm import LGBMClassifier
+from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
+import logging
+import os
+from nppr_module import NpprInferenceModule
 from nppr_dataset import NPPRDataset
 from nppr_loss import nppr_loss
 
@@ -48,12 +53,14 @@ def get_dataloader(data_path, numeric_cols, categorical_cols, time_col, max_past
     return dataloader
 
 class InferenceCallback(Callback):
-    def __init__(self, train_clf_dataloader, test_clf_dataloader, train_clf_path, test_clf_path, train_target_path, embedding_dims, embedding_size,
-                 hidden_size_enc, hidden_size_dec, num_numerical_features, num_categories, inference_device="cuda:1"):
+    def __init__(self, checkpoint_callback, train_clf_dataloader, test_clf_dataloader, train_clf_path, test_clf_path,
+                 train_target_path, embedding_dims, embedding_size, hidden_size_enc, hidden_size_dec,
+                 num_numerical_features, num_categories, inference_device="cuda:1"):
         """
         Callback for inference and evaluation after each epoch.
 
         Args:
+            checkpoint_callback: Reference to the ModelCheckpoint instance.
             train_clf_dataloader: Dataloader for training data.
             test_clf_dataloader: Dataloader for testing data.
             train_clf_path: Path to parquet file with training data.
@@ -68,6 +75,7 @@ class InferenceCallback(Callback):
             inference_device: Device for inference (default is "cuda:1").
         """
         super().__init__()
+        self.checkpoint_callback = checkpoint_callback
         self.train_clf_dataloader = train_clf_dataloader
         self.test_clf_dataloader = test_clf_dataloader
         self.train_clf = pd.read_parquet(train_clf_path)
@@ -83,59 +91,72 @@ class InferenceCallback(Callback):
         self.results = []
 
     def on_train_epoch_end(self, trainer, pl_module):
-        # Use checkpoint from the last completed epoch
-        checkpoint_path = trainer.checkpoint_callback.last_model_path
+        logging.info("InferenceCallback: Starting on_train_epoch_end.")
+        checkpoint_path = self.checkpoint_callback.last_model_path
 
         # Ensure checkpoint_path is valid
-        if not checkpoint_path:
-            raise RuntimeError("Checkpoint path for the last epoch is not available.")
+        if not checkpoint_path or not os.path.exists(checkpoint_path):
+            logging.warning(f"No checkpoint found for epoch {trainer.current_epoch}. Skipping inference.")
+            return
 
-        # Load the model for inference
-        inference_module = NpprInferenceModule(
-            model_path=checkpoint_path,
-            embedding_dims=self.embedding_dims,
-            embedding_size=self.embedding_size,
-            hidden_size_enc=self.hidden_size_enc,
-            hidden_size_dec=self.hidden_size_dec,
-            num_numerical_features=self.num_numerical_features,
-            num_categories=self.num_categories,
-            device=torch.device(self.inference_device)
-        )
+        try:
+            # Load the model for inference
+            inference_module = NpprInferenceModule(
+                model_path=checkpoint_path,
+                embedding_dims=self.embedding_dims,
+                embedding_size=self.embedding_size,
+                hidden_size_enc=self.hidden_size_enc,
+                hidden_size_dec=self.hidden_size_dec,
+                num_numerical_features=self.num_numerical_features,
+                num_categories=self.num_categories,
+                device=torch.device(self.inference_device)
+            )
+            logging.info("Inference module initialized successfully.")
+        except Exception as e:
+            logging.error(f"Failed to initialize inference module: {e}")
+            return
 
-        # Generate embeddings
-        train_embeddings = inference_module(self.train_clf_dataloader)
-        test_embeddings = inference_module(self.test_clf_dataloader)
+        # Perform inference and evaluation
+        try:
+            # Generate embeddings
+            train_embeddings = inference_module.encode(self.train_clf_dataloader)
+            test_embeddings = inference_module.encode(self.test_clf_dataloader)
 
-        # Ensure embeddings are paired with app_id
-        train_app_ids = self.train_clf['app_id'].unique()
-        test_app_ids = self.test_clf['app_id'].unique()
+            # Ensure embeddings are paired with app_id
+            train_app_ids = self.train_clf['app_id'].unique()
+            test_app_ids = self.test_clf['app_id'].unique()
 
-        train_embeddings_df = pd.DataFrame(train_embeddings)
-        train_embeddings_df['app_id'] = train_app_ids
+            train_embeddings_df = pd.DataFrame(train_embeddings)
+            train_embeddings_df['app_id'] = train_app_ids
 
-        test_embeddings_df = pd.DataFrame(test_embeddings)
-        test_embeddings_df['app_id'] = test_app_ids
+            test_embeddings_df = pd.DataFrame(test_embeddings)
+            test_embeddings_df['app_id'] = test_app_ids
 
-        # Merge embeddings with targets
-        train_data = train_embeddings_df.merge(self.train_target[['app_id', 'flag']], on='app_id', how='inner')
-        test_data = test_embeddings_df.merge(self.train_target[['app_id', 'flag']], on='app_id', how='inner')
+            # Merge embeddings with targets
+            train_data = train_embeddings_df.merge(self.train_target[['app_id', 'flag']], on='app_id', how='inner')
+            test_data = test_embeddings_df.merge(self.train_target[['app_id', 'flag']], on='app_id', how='inner')
 
-        # Extract features and targets
-        X_train = train_data.drop(columns=['app_id', 'flag']).values
-        y_train = train_data['flag'].values
+            # Extract features and targets
+            X_train = train_data.drop(columns=['app_id', 'flag']).values
+            y_train = train_data['flag'].values
 
-        X_test = test_data.drop(columns=['app_id', 'flag']).values
-        y_test = test_data['flag'].values
+            X_test = test_data.drop(columns=['app_id', 'flag']).values
+            y_test = test_data['flag'].values
 
-        # Train LGBM classifier and evaluate
-        model = LGBMClassifier(random_state=42, n_estimators=500, boosting_type='gbdt', objective='binary',
-                    subsample=0.5, subsample_freq=1, learning_rate=0.02, max_depth=6, reg_alpha=1, reg_lambda=1, min_child_samples=50,
-                    colsample_bytree=0.75)
-        model.fit(X_train, y_train)
-        y_pred = model.predict_proba(X_test)[:, 1]
-        roc_auc = roc_auc_score(y_test, y_pred)
+            # Train LGBM classifier and evaluate
+            model = LGBMClassifier(
+                random_state=42, n_estimators=500, boosting_type='gbdt', objective='binary',
+                subsample=0.5, subsample_freq=1, learning_rate=0.02, max_depth=6, reg_alpha=1, reg_lambda=1,
+                min_child_samples=50, colsample_bytree=0.75
+            )
+            model.fit(X_train, y_train)
+            y_pred = model.predict_proba(X_test)[:, 1]
+            roc_auc = roc_auc_score(y_test, y_pred)
 
-        # Log and save results
-        self.results.append({'Num Epoch': trainer.current_epoch + 1, 'Score': roc_auc})
-        with open("results.txt", "a") as f:
-            f.write(f"{trainer.current_epoch + 1}\t{roc_auc:.4f}\n")
+            # Log and save results
+            self.results.append({'Num Epoch': trainer.current_epoch + 1, 'Score': roc_auc})
+            with open("results.txt", "a") as f:
+                f.write(f"{trainer.current_epoch + 1}\t{roc_auc:.4f}\n")
+            logging.info(f"Epoch {trainer.current_epoch + 1}: ROC AUC = {roc_auc:.4f}")
+        except Exception as e:
+            logging.error(f"Error during inference or evaluation: {e}")
