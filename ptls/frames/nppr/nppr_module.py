@@ -106,6 +106,9 @@ class NPDecoder(nn.Module):
         """
         super(NPDecoder, self).__init__()
         
+        self.num_numerical_features = num_numerical_features
+        self.num_categories = num_categories
+
         # MLP decoder layers for NP task
         self.decoder = nn.Sequential(
             nn.Linear(embedding_size, hidden_size),
@@ -116,8 +119,6 @@ class NPDecoder(nn.Module):
         
         # Output layer for generating outputs for numerical and categorical features
         self.output_layer = nn.Linear(hidden_size, num_numerical_features + sum(num_categories))
-        self.num_numerical_features = num_numerical_features
-        self.num_categories = num_categories
 
     def forward(self, e_t):
         """
@@ -165,6 +166,9 @@ class PRDecoder(nn.Module):
         """
         super(PRDecoder, self).__init__()
         
+        self.num_numerical_features = num_numerical_features
+        self.num_categories = num_categories
+        
         # MLP decoder layers for PR task
         self.decoder = nn.Sequential(
             nn.Linear(embedding_size + 1, hidden_size),  # +1 for the concatenated time gap
@@ -175,8 +179,6 @@ class PRDecoder(nn.Module):
         
         # Output layer for generating outputs for numerical and categorical features
         self.output_layer = nn.Linear(hidden_size, num_numerical_features + sum(num_categories))
-        self.num_numerical_features = num_numerical_features
-        self.num_categories = num_categories
 
     def forward(self, e_t, time_gaps):
         """
