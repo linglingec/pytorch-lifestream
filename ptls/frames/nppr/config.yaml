@@ -58,9 +58,11 @@ model:
   num_numerical_features: 1
   pct_start: 0.2
   total_steps: 642270
+  results_path: "results_past-events=50.txt"
 
 training:
   batch_size: 64
   num_workers: 8
   num_epochs: 30
-  max_past_events: 5
+  max_past_events: 50
+  last_n_transactions: 500

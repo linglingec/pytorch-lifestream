@@ -4,7 +4,8 @@ from torch.nn.utils.rnn import pad_sequence
 import pandas as pd
 
 class NPPRDataset(Dataset):
-    def __init__(self, data: pd.DataFrame, numeric_cols=None, categorical_cols=None, time_col="hour_diff", max_past_events=5):
+    def __init__(self, data: pd.DataFrame, numeric_cols=None, categorical_cols=None, time_col="hour_diff", 
+                max_past_events=50, last_n_transactions=None, train=True):
         """
         Initializes the dataset for transaction sequences from a DataFrame.
 
@@ -14,11 +15,15 @@ class NPPRDataset(Dataset):
             categorical_cols (list of str): List of column names for categorical features.
             time_col (str): Column name representing time difference between transactions (for PR task).
             max_past_events (int): Maximum number of past events to consider for time gaps.
+            last_n_transactions (int): Number of latest transactions to use during training. None for inference.
+            train (bool): Flag to indicate whether the dataset is for training (True) or inference (False).
         """
         self.numeric_cols = numeric_cols if numeric_cols is not None else []
         self.categorical_cols = categorical_cols if categorical_cols is not None else []
         self.time_col = time_col
         self.max_past_events = max_past_events
+        self.last_n_transactions = last_n_transactions
+        self.train = train
 
         # Sort data by application ID and reset index
         data = data.sort_values(by=["app_id", "transaction_number"]).reset_index(drop=True)
@@ -45,6 +50,10 @@ class NPPRDataset(Dataset):
                 - List of time gaps for each event up to max_past_events
         """
         sequence = self.sequences[index]
+
+        # Select last N transactions for training, or all transactions for inference
+        if self.train and self.last_n_transactions is not None:
+            sequence = sequence.iloc[-self.last_n_transactions:]
         
         # Extract numeric features
         numeric_features = torch.tensor(sequence[self.numeric_cols].fillna(0).values, dtype=torch.float32)
@@ -54,6 +63,7 @@ class NPPRDataset(Dataset):
         
         # Calculate time gaps for each event
         hour_diffs = sequence[self.time_col].fillna(0).values
+        hour_diffs[0] = -1
         time_gaps = []
 
         for t in range(len(hour_diffs)):

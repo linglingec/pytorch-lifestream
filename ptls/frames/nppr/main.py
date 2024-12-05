@@ -67,6 +67,7 @@ try:
         data_config["categorical_cols"],
         data_config["time_col"],
         training_config["max_past_events"],
+        training_config["last_n_transactions"],
         training_config["batch_size"],
         training_config["num_workers"],
         train=True
@@ -77,6 +78,7 @@ try:
         data_config["categorical_cols"],
         data_config["time_col"],
         training_config["max_past_events"],
+        None,
         training_config["batch_size"],
         training_config["num_workers"],
         train=False
@@ -87,6 +89,7 @@ try:
         data_config["categorical_cols"],
         data_config["time_col"],
         training_config["max_past_events"],
+        None,
         training_config["batch_size"],
         training_config["num_workers"],
         train=False
@@ -132,7 +135,7 @@ except Exception as e:
 # Define callbacks
 try:
     checkpoint_callback = ModelCheckpoint(
-        dirpath="checkpoints",
+        dirpath="checkpoints_past-events=50",
         filename="nppr-{epoch:02d}",
         save_top_k=-1,
         save_weights_only=True,
@@ -150,6 +153,7 @@ try:
         train_clf_path=data_config["train_clf_path"],
         test_clf_path=data_config["test_clf_path"],
         train_target_path=data_config["train_target_path"],
+        results_path=model_config["results_path"],
         embedding_dims=model_config["embedding_dims"],
         embedding_size=model_config["embedding_size"],
         hidden_size_enc=model_config["hidden_size_enc"],
